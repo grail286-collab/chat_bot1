@@ -6,8 +6,10 @@ Telegram-бот коуча Анны Малышевой.
 import asyncio
 import logging
 import os
+import socket
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -107,11 +109,47 @@ async def on_other(message: Message):
     await message.answer(data["fallback"], reply_markup=inline_kb)
 
 
+TG_HOST = "api.telegram.org"
+
+
+async def _can_connect(family: int, timeout: float = 6.0) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(TG_HOST, 443, family=family), timeout
+        )
+        writer.close()
+        return True
+    except Exception:
+        return False
+
+
+async def build_session() -> AiohttpSession:
+    """Настраивает подключение к Telegram.
+    1) Если задан прокси (OUTBOUND_PROXY_URL / RELAXDEV_PROXY_URL / TG_PROXY) — через него.
+    2) Иначе проверяет, доступен ли Telegram по IPv4; если нет, но доступен по IPv6
+       (так на серверах RelaxDev) — работает только через IPv6."""
+    proxy = (os.getenv("TG_PROXY") or os.getenv("OUTBOUND_PROXY_URL")
+             or os.getenv("RELAXDEV_PROXY_URL"))
+    if proxy:
+        logging.info("Подключение к Telegram через прокси")
+        return AiohttpSession(proxy=proxy)
+
+    session = AiohttpSession()
+    if await _can_connect(socket.AF_INET):
+        logging.info("Подключение к Telegram по IPv4")
+    elif await _can_connect(socket.AF_INET6):
+        logging.info("IPv4 недоступен, подключение к Telegram по IPv6")
+        session._connector_init["family"] = socket.AF_INET6
+    else:
+        logging.error("Telegram недоступен ни по IPv4, ни по IPv6 — проверьте сеть сервера")
+    return session
+
+
 async def main():
     token = os.getenv("BOT_TOKEN") or os.getenv("TG_TOKEN")
     if not token:
         raise SystemExit("Укажите переменную окружения BOT_TOKEN в панели RelaxDev")
-    bot = Bot(token)
+    bot = Bot(token, session=await build_session())
     print("Telegram-бот запущен. Ctrl+C — остановить.")
     await dp.start_polling(bot)
 
