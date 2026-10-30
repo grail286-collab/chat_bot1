@@ -85,7 +85,7 @@ def load_stats() -> dict:
     try:
         return json.loads(STATS_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return {"guide": [], "booking": []}
+        return {}
 
 
 def add_stat(kind: str, user: User):
@@ -146,10 +146,12 @@ async def give_topic(message: Message, user: User, topic: dict):
     await message.answer(topic["answer"], reply_markup=keyboard, disable_web_page_preview=True)
     await send_topic_files(message, topic)
     if topic.get("files"):
-        stats = add_stat("guide", user)
-        total = count(stats["guide"], unique=True)
+        kind = topic.get("id", "guide")
+        stats = add_stat(kind, user)
+        total = count(stats[kind], unique=True)
         now = datetime.now(TZ).strftime("%d.%m, %H:%M")
-        await notify_admins(message.bot, f"🔔 Гайд забрали\n{who(user)}\n{now} · всего людей: {total}")
+        label = html.escape(topic.get("stat_name", topic["title"]))
+        await notify_admins(message.bot, f"🔔 Забрали: {label}\n{who(user)}\n{now} · всего людей: {total}")
 
 
 # ---------- запись на сессию ----------
@@ -240,14 +242,15 @@ async def cmd_stats(message: Message):
     now = datetime.now(TZ)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week = now - timedelta(days=7)
-    g, b = s.get("guide", []), s.get("booking", [])
-    await message.answer(
-        "📊 Статистика\n\n"
-        f"Гайд забрали: {count(g, unique=True)} чел.\n"
-        f"  сегодня: {count(g, today, True)} · за 7 дней: {count(g, week, True)}\n\n"
-        f"Записей на сессию: {len(b)}\n"
-        f"  сегодня: {count(b, today)} · за 7 дней: {count(b, week)}"
-    )
+    lines = ["📊 Статистика\n"]
+    for t in data["topics"]:
+        items = s.get(t.get("id", "guide"), [])
+        lines.append(f"{t.get('stat_name', t['title'])}: {count(items, unique=True)} чел.\n"
+                     f"  сегодня: {count(items, today, True)} · за 7 дней: {count(items, week, True)}\n")
+    b = s.get("booking", [])
+    lines.append(f"Записей на сессию: {len(b)}\n"
+                 f"  сегодня: {count(b, today)} · за 7 дней: {count(b, week)}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("reload"))
