@@ -1,6 +1,8 @@
 """
 Telegram-бот коуча Анны Малышевой.
-- Приветствие с кнопками «Получить гайд» и «Записаться на сессию».
+- Приветствие с кнопками «Получить гайд», «Компас перемен» и «Записаться на сессию».
+- «Компас перемен» открывается прямо в Telegram как мини-приложение
+  (бот сам раздаёт страницу по адресу WEBAPP_URL/kompas).
 - Гайд: бот присылает PDF и уведомляет владельца.
 - Запись: бот спрашивает имя, контакт и удобное время и присылает заявку владельцу.
 - /stats — статистика для владельца, /myid — узнать свой Telegram ID.
@@ -21,6 +23,7 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    WebAppInfo,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -31,6 +34,8 @@ from aiogram.types import (
     User,
 )
 from aiogram.utils.chat_action import ChatActionSender
+from aiogram.utils.web_app import safe_parse_webapp_init_data
+from aiohttp import web
 
 from core import load_answers, find_topic, normalize, topic_files
 
@@ -40,6 +45,8 @@ TG_MAX_FILE = 50 * 1024 * 1024  # лимит Telegram для отправки б
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Yakutsk"))
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent / "data"))
 STATS_FILE = DATA_DIR / "stats.json"
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")  # https://имя.relaxdev.ru
+BASE_DIR = Path(__file__).resolve().parent
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x.isdigit()}
 
 data = load_answers()
@@ -58,15 +65,29 @@ CANCEL = "Отмена"
 SKIP = "Пропустить"
 
 
+def webapp_url(topic: dict) -> str | None:
+    """Адрес мини-приложения темы или None (тогда бот просто пришлёт файл)."""
+    if WEBAPP_URL.startswith("https://") and topic.get("webapp"):
+        return WEBAPP_URL + topic["webapp"]
+    return None
+
+
 def build_keyboard():
-    rows = [[KeyboardButton(text=t["title"])] for t in data["topics"]]
+    rows = []
+    for t in data["topics"]:
+        url = webapp_url(t)
+        rows.append([KeyboardButton(text=t["title"], web_app=WebAppInfo(url=url)) if url
+                     else KeyboardButton(text=t["title"])])
     rows.append([KeyboardButton(text=bk("button"))])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
 def build_inline():
-    rows = [[InlineKeyboardButton(text=t["title"], callback_data=f"topic:{i}")]
-            for i, t in enumerate(data["topics"])]
+    rows = []
+    for i, t in enumerate(data["topics"]):
+        url = webapp_url(t)
+        rows.append([InlineKeyboardButton(text=t["title"], web_app=WebAppInfo(url=url)) if url
+                     else InlineKeyboardButton(text=t["title"], callback_data=f"topic:{i}")])
     rows.append([InlineKeyboardButton(text=bk("button"), callback_data="book")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -88,7 +109,7 @@ def load_stats() -> dict:
         return {}
 
 
-def add_stat(kind: str, user: User):
+def add_stat(kind: str, user):
     stats = load_stats()
     stats.setdefault(kind, []).append({"id": user.id, "t": datetime.now(TZ).isoformat()})
     try:
@@ -104,8 +125,10 @@ def count(items: list, since: datetime | None = None, unique=False) -> int:
     return len({x["id"] for x in sel}) if unique else len(sel)
 
 
-def who(user: User) -> str:
-    name = html.escape(user.full_name or "Без имени")
+def who(user) -> str:
+    full = getattr(user, "full_name", None) or " ".join(
+        x for x in (getattr(user, "first_name", ""), getattr(user, "last_name", "")) if x)
+    name = html.escape(full or "Без имени")
     uname = f"@{user.username}" if user.username else "без username"
     return f'<a href="tg://user?id={user.id}">{name}</a> · {uname}'
 
@@ -142,16 +165,26 @@ async def send_topic_files(message: Message, topic: dict):
         await message.answer("⚠️ Файл временно недоступен, попробуйте позже.")
 
 
+async def record_and_notify(bot: Bot, topic: dict, user, verb="Забрали"):
+    kind = topic.get("id", "guide")
+    stats = add_stat(kind, user)
+    total = count(stats[kind], unique=True)
+    now = datetime.now(TZ).strftime("%d.%m, %H:%M")
+    label = html.escape(topic.get("stat_name", topic["title"]))
+    await notify_admins(bot, f"🔔 {verb}: {label}\n{who(user)}\n{now} · всего людей: {total}")
+
+
 async def give_topic(message: Message, user: User, topic: dict):
+    url = webapp_url(topic)
+    if url:  # мини-приложение: кнопка, открывающая страницу прямо в Telegram
+        btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=topic.get("webapp_button", "Открыть"), web_app=WebAppInfo(url=url))]])
+        await message.answer(topic.get("webapp_answer", topic["answer"]), reply_markup=btn)
+        return  # статистику и уведомление пришлёт сама страница при открытии
     await message.answer(topic["answer"], reply_markup=keyboard, disable_web_page_preview=True)
     await send_topic_files(message, topic)
     if topic.get("files"):
-        kind = topic.get("id", "guide")
-        stats = add_stat(kind, user)
-        total = count(stats[kind], unique=True)
-        now = datetime.now(TZ).strftime("%d.%m, %H:%M")
-        label = html.escape(topic.get("stat_name", topic["title"]))
-        await notify_admins(message.bot, f"🔔 Забрали: {label}\n{who(user)}\n{now} · всего людей: {total}")
+        await record_and_notify(message.bot, topic, user)
 
 
 # ---------- запись на сессию ----------
@@ -305,6 +338,74 @@ async def on_other(message: Message):
     await message.answer(data["fallback"], reply_markup=inline_kb)
 
 
+# ---------- веб-сервер для мини-приложений ----------
+
+TG_SNIPPET = """
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function(){try{var tg=window.Telegram&&window.Telegram.WebApp;if(!tg)return;
+tg.ready();tg.expand();
+if(tg.initData){fetch('/api/opened?page='+encodeURIComponent(location.pathname),
+{method:'POST',headers:{'Content-Type':'text/plain'},body:tg.initData}).catch(function(){});}
+}catch(e){}})();
+</script>
+"""
+
+
+def webapp_topic(path: str) -> dict | None:
+    return next((t for t in data["topics"] if t.get("webapp") == path), None)
+
+
+def make_web_app(bot: Bot, token: str) -> web.Application:
+    app = web.Application()
+
+    async def index(_):
+        return web.Response(text="ok")
+
+    async def page(request: web.Request):
+        topic = webapp_topic(request.path)
+        if not topic or not topic.get("files"):
+            raise web.HTTPNotFound()
+        files, _ = topic_files(topic)
+        if not files:
+            raise web.HTTPNotFound()
+        body = files[0][0].read_text(encoding="utf-8")
+        i = body.lower().rfind("</body>")
+        body = body[:i] + TG_SNIPPET + body[i:] if i >= 0 else body + TG_SNIPPET
+        return web.Response(text=body, content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-cache"})
+
+    async def opened(request: web.Request):
+        try:
+            init = safe_parse_webapp_init_data(token=token, init_data=await request.text())
+        except Exception:
+            raise web.HTTPForbidden()  # запрос не из Telegram — игнорируем
+        topic = webapp_topic(request.query.get("page", ""))
+        if topic and init.user:
+            await record_and_notify(bot, topic, init.user, verb="Открыли")
+        return web.Response(text="ok")
+
+    app.router.add_get("/", index)
+    for t in data["topics"]:
+        if t.get("webapp"):
+            app.router.add_get(t["webapp"], page)
+    app.router.add_post("/api/opened", opened)
+    return app
+
+
+async def start_web(bot: Bot, token: str):
+    port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or 8080)
+    runner = web.AppRunner(make_web_app(bot, token))
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info("Веб-сервер мини-приложений слушает порт %s", port)
+    if WEBAPP_URL:
+        logging.info("Мини-приложения открываются по адресу %s", WEBAPP_URL)
+    else:
+        logging.warning("WEBAPP_URL не задан — «Компас перемен» будет отправляться файлом. "
+                        "Добавьте переменную WEBAPP_URL=https://<ваш-проект>.relaxdev.ru")
+
+
 # ---------- подключение к Telegram ----------
 
 TG_HOST = "api.telegram.org"
@@ -348,6 +449,7 @@ async def main():
         logging.warning("ADMIN_ID не задан: уведомления о записях и гайде никому не придут. "
                         "Напишите боту /myid и добавьте этот номер в переменную ADMIN_ID.")
     bot = Bot(token, session=await build_session())
+    await start_web(bot, token)
     print("Telegram-бот запущен. Ctrl+C — остановить.")
     await dp.start_polling(bot)
 
